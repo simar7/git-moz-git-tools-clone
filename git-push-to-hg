@@ -1,0 +1,144 @@
+#!/bin/bash
+set -e
+
+# Push some commits from git to the git-temp qqueue in a given hg repository.
+# Note that this nukes the git-temp qqueue, if it exists.
+#
+# If no commit range is specified, we push
+#
+#   $(git merge-base $(git-tracks -d) HEAD)..HEAD.
+#
+# Otherwise, we push the commit(s) given.
+
+PATH="$(dirname $0):$PATH"
+
+$(dirname $0)/private/check-for-updates
+
+# Read git version and note if it's less than 1.7.6, because older versions do
+# not support git-format-patch --quiet properly.
+
+function git_version() {
+  # Get the $1'th part of the git version.
+  git version | cut -f 3 -d ' ' | cut -f $1 -d '.'
+}
+
+# "Old git" means less than 1.7.5.  Earlier versions do not work well with git
+# diff --quiet.  See https://github.com/jlebar/moz-git-tools/issues/1.
+if (( ($(git_version 1) == 1 && $(git_version 2) == 7 && $(git_version 3) < 5) ||
+      ($(git_version 1) == 1 && $(git_version 2) < 7) )); then
+  old_git=1
+else
+  old_git=0
+fi
+
+push_to_tip=0
+if [[ "$1" == "-t" || "$1" == "--tip" ]]; then
+  push_to_tip=1
+  shift
+fi
+
+hg_repo="$1"
+if [[ "$1" == "" ]]; then
+  echo "Usage: $(basename $0) [-t/--tip] path-to-hg-repo [git-revs]" 1>& 2
+  exit 255
+fi
+
+revs="$2"
+if [[ "$revs" == "" ]]; then
+  revs="$(git merge-base HEAD $(git tracks -d))..HEAD"
+fi
+
+# If revs doesn't contain "..", add "$revs^.." to the beginning.
+# git-format-patch needs this, otherwise it'll format all patches since $revs.
+if ! echo "$revs" | fgrep ".."; then
+  revs="$revs^..$revs"
+fi
+
+# Check that $revs is a linear sequence of commits.  We don't support anything
+# else, at the moment.
+if [[ "$(git log --merges $revs)" != "" ]]; then
+  echo ""
+  echo "It looks like the commit range we're trying to push contains merges."
+  echo "We do not currently support this; sorry!  As a workaround, fold your"
+  echo "commits."
+  echo ""
+  echo "Run "
+  echo ""
+  echo "  $ git log --merges $revs"
+  echo ""
+  echo "to see the list of the offending merge commits."
+  exit 1
+fi
+
+echo "On branch $(git branch | grep '^\*' | cut -f 2 -d ' ')."
+git --no-pager log --reverse --date-order --pretty=oneline --abbrev-commit $revs
+
+git_status=$(git status --porcelain)
+if [[ "$git_status" != "" ]]; then
+  echo ""
+  echo "Warning; tree has uncommitted changes!  The following changes will "
+  echo "not be pushed."
+  echo "$git_status"
+  read -sn1 -p "Press any key to continue, or <ctrl-c> to quit. "
+  echo ""
+fi
+
+function hg_cmd() {
+  #echo "hg "$@"" >&2
+  hg -R "$hg_repo" -q $@ > /dev/null
+}
+
+first_rev=$(echo "$revs" | sed -e 's/\.\..*//')
+git_parent_rev=$(git merge-base $first_rev $(git tracks -d))
+
+# Run git-to-hg-commit, and only run hg pull if it fails.
+if [[ "$push_to_tip" == "0" ]]; then
+  hg_parent_rev=$(git-to-hg-commit "$hg_repo" $git_parent_rev 2> /dev/null ||            \
+                  (hg_cmd pull &&                                                        \
+                   git-to-hg-commit "$hg_repo" $git_parent_rev 2> /dev/null ||           \
+                   (echo "No matching commit found.  (Try pushing with --tip.)" 1>& 2 && \
+                    exit 2)))
+else
+  hg_parent_rev="tip"
+fi
+
+hg_cmd up --rev "$hg_parent_rev"
+
+# Run qpop -a only if there are patches applied, so we don't see "no patches
+# applied".  (We could qpop -a and ignore stderr, but then we could ignore a
+# real error!)
+if [[ $(hg -R "$hg_repo" qapplied) != "" ]]; then
+  hg_cmd qpop -a
+fi
+
+# Switch to the patches queue (which we assume exists) so we can delete
+# git-temp.
+hg_cmd qqueue patches
+hg_cmd qqueue -q --purge git-temp || true
+hg_cmd qqueue -q --create git-temp
+
+# If we passed --tip, do hg pull && hg up.  (This isn't the same as hg pull -u:
+# if there's nothing to pull, hg pull -u will skip the update!)
+if [[ "$push_to_tip" != 0 ]]; then
+  hg_cmd pull
+  hg_cmd up --check
+fi
+
+# Pass --quiet only for not-old-git.
+if [[ "$old_git" == 0 ]]; then
+  git_format_quiet='--quiet'
+fi
+
+git format-patch $git_format_quiet -M -C -pk $revs -o ""$hg_repo"/.hg/patches-git-temp"
+
+pushd ""$hg_repo"/.hg/patches-git-temp" > /dev/null
+  find . -name '*.patch' | sort -g > series
+
+  # There might not be any patches here, in which case git-patch-to-hg-patch
+  # will hang!
+  if [[ "$(cat series)" != "" ]]; then
+    git-patch-to-hg-patch $(cat series)
+  fi
+popd > /dev/null
+
+hg_cmd qpush -a
